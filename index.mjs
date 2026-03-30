@@ -699,3 +699,43 @@ app.post('/lp/claim-fees', async (req, res) => {
     }
   } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
+
+// ══════════════════════════════════════════
+// USER PERSISTENCE — store bot users across Railway restarts
+// ══════════════════════════════════════════
+const USERS_FILE = './bot-users.json';
+let botUsers = {};
+try {
+  if (existsSync(USERS_FILE)) {
+    botUsers = JSON.parse(readFileSync(USERS_FILE, 'utf8'));
+    console.log(`✅ Loaded ${Object.keys(botUsers).length} bot users`);
+  }
+} catch(e) {}
+
+function saveBotUsers() {
+  try { writeFileSync(USERS_FILE, JSON.stringify(botUsers, null, 2)); }
+  catch(e) { console.error('Save bot users error:', e.message); }
+}
+
+app.post('/users/sync', (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { users } = req.body;
+  if (!users) return res.status(400).json({ error: 'users required' });
+  // Merge — don't overwrite existing users with empty data
+  for (const [id, u] of Object.entries(users)) {
+    if (u?.privateKey || u?.wallet) botUsers[id] = u;
+  }
+  saveBotUsers();
+  res.json({ success: true, count: Object.keys(botUsers).length });
+});
+
+app.get('/users/load', (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  res.json({ users: botUsers, count: Object.keys(botUsers).length });
+});
