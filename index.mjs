@@ -4,6 +4,7 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Transaction } from '@mysten/sui/transactions';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { startArenaMonitor } from './arena-monitor.mjs';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -332,4 +333,9 @@ app.listen(PORT, () => {
   console.log(`Registry:  ${REGISTRY_ID}`);
   console.log(`Arena:     ${ARENA_PACKAGE}`);
   console.log(`Round:     ${currentRoundId}`);
+  // Auto start arena monitor
+  if (currentRoundId) {
+    startArenaMonitor(currentRoundId).catch(e => console.error('Monitor error:', e.message));
+    console.log('🏟 Arena monitor started');
+  }
 });
