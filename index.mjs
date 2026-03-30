@@ -24,9 +24,10 @@ const POOL_ID        = '0xba79012088507127692c8c8ba97d4fdc4a83d2f9fff4e9a1ea61eb
 const POOL_PACKAGE    = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
 const CLOCK_ID        = '0x0000000000000000000000000000000000000000000000000000000000000006';
 // LP Pool
-const LP_POOL_ID      = process.env.LP_POOL_ID      || null;
-const LP_POOL_PACKAGE = process.env.LP_POOL_PACKAGE || null;
-const LP_ADMIN_CAP    = process.env.LP_ADMIN_CAP    || null;
+const LP_POOL_ID      = process.env.LP_POOL_ID      || '0xe2cb18758423840159a11243387efc27c21db171ba97c1bad2d6009a474d2e79';
+const LP_POOL_PACKAGE = process.env.LP_POOL_PACKAGE || '0xf554dad1683cb25386ddf57f2d40f2774fb8287b17f467ebc657c5bc20f226e3';
+const LP_ADMIN_CAP    = process.env.LP_ADMIN_CAP    || '0xcaf008988b557cc9ddf4a5921e42d2440db13e108f05c884c44c57903bc7c4e5';
+const SPLIT_RATIO     = 0.70; // 70% old pool, 30% LP pool
 const ARENA_PACKAGE  = '0xac38870890071543644ea81d1f5fe8000d45030c266c82c24c26eccbf0c239db';
 const ARENA_OBJECT   = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
 const ARENA_ADMIN_CAP= '0x81d63f7fecfab19b5409c29dead1e695a349f56e29269d03980ebfad64442695';
@@ -510,22 +511,42 @@ app.post('/build-tx', async (req, res) => {
     tx.setSender(sender);
 
     if (action === 'buy') {
-      // Buy $AGENT from official pool — requires AgentBadge
+      // Buy $AGENT — splits across old pool (badge) + LP pool
       if (!badgeId) return res.status(400).json({ error: 'badgeId required for buy' });
-      const [coin] = tx.splitCoins(tx.gas, [amount]);
-      const [out]  = tx.moveCall({
-        target: `${POOL_PACKAGE}::pool::buy_agent_verified`,
-        arguments: [
-          tx.object(POOL_ID), tx.object(badgeId),
-          tx.object(REGISTRY_ID), coin,
-          tx.pure.u64(0), tx.object(CLOCK_ID)
-        ]
-      });
-      tx.transferObjects([out], sender);
-      tx.setGasBudget(15_000_000);
+      // Check LP pool has liquidity
+      let lpHasLiq = false;
+      try {
+        const lpObj = await client.getObject({ id: LP_POOL_ID, options: { showContent: true } });
+        const lf = lpObj.data?.content?.fields || {};
+        lpHasLiq = parseInt(lf.sui_reserve?.fields?.balance || lf.sui_reserve || 0) > 1_000_000_000;
+      } catch(e) {}
+
+      if (lpHasLiq) {
+        const mainAmt = Math.floor(amount * SPLIT_RATIO);
+        const lpAmt   = amount - mainAmt;
+        const [mainCoin] = tx.splitCoins(tx.gas, [mainAmt]);
+        const [lpCoin]   = tx.splitCoins(tx.gas, [lpAmt]);
+        const [out1] = tx.moveCall({
+          target: `${POOL_PACKAGE}::pool::buy_agent_verified`,
+          arguments: [tx.object(POOL_ID), tx.object(badgeId), tx.object(REGISTRY_ID), mainCoin, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        const [out2] = tx.moveCall({
+          target: `${LP_POOL_PACKAGE}::pool_lp::buy_agent`,
+          arguments: [tx.object(LP_POOL_ID), lpCoin, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        tx.transferObjects([out1, out2], sender);
+      } else {
+        const [coin] = tx.splitCoins(tx.gas, [amount]);
+        const [out]  = tx.moveCall({
+          target: `${POOL_PACKAGE}::pool::buy_agent_verified`,
+          arguments: [tx.object(POOL_ID), tx.object(badgeId), tx.object(REGISTRY_ID), coin, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        tx.transferObjects([out], sender);
+      }
+      tx.setGasBudget(20_000_000);
 
     } else if (action === 'sell') {
-      // Sell $AGENT to official pool — requires AgentBadge
+      // Sell $AGENT — splits across both pools
       if (!badgeId) return res.status(400).json({ error: 'badgeId required for sell' });
       const agentCoins = await client.getCoins({ owner: sender, coinType: COIN_TYPE });
       if (!agentCoins.data.length) return res.status(400).json({ error: 'No $AGENT coins found' });
@@ -533,17 +554,36 @@ app.post('/build-tx', async (req, res) => {
       if (agentCoins.data.length > 1) {
         tx.mergeCoins(primary, agentCoins.data.slice(1).map(c => tx.object(c.coinObjectId)));
       }
-      const [aCoin] = tx.splitCoins(primary, [amount]);
-      const [out]   = tx.moveCall({
-        target: `${POOL_PACKAGE}::pool::sell_agent_verified`,
-        arguments: [
-          tx.object(POOL_ID), tx.object(badgeId),
-          tx.object(REGISTRY_ID), aCoin,
-          tx.pure.u64(0), tx.object(CLOCK_ID)
-        ]
-      });
-      tx.transferObjects([out], sender);
-      tx.setGasBudget(15_000_000);
+      let lpHasLiq = false;
+      try {
+        const lpObj = await client.getObject({ id: LP_POOL_ID, options: { showContent: true } });
+        const lf = lpObj.data?.content?.fields || {};
+        lpHasLiq = parseInt(lf.sui_reserve?.fields?.balance || lf.sui_reserve || 0) > 1_000_000_000;
+      } catch(e) {}
+
+      if (lpHasLiq) {
+        const mainAmt = Math.floor(amount * SPLIT_RATIO);
+        const lpAmt   = amount - mainAmt;
+        const [mainAgent] = tx.splitCoins(primary, [mainAmt]);
+        const [lpAgent]   = tx.splitCoins(primary, [lpAmt]);
+        const [sui1] = tx.moveCall({
+          target: `${POOL_PACKAGE}::pool::sell_agent_verified`,
+          arguments: [tx.object(POOL_ID), tx.object(badgeId), tx.object(REGISTRY_ID), mainAgent, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        const [sui2] = tx.moveCall({
+          target: `${LP_POOL_PACKAGE}::pool_lp::sell_agent`,
+          arguments: [tx.object(LP_POOL_ID), lpAgent, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        tx.transferObjects([sui1, sui2], sender);
+      } else {
+        const [aCoin] = tx.splitCoins(primary, [amount]);
+        const [out]   = tx.moveCall({
+          target: `${POOL_PACKAGE}::pool::sell_agent_verified`,
+          arguments: [tx.object(POOL_ID), tx.object(badgeId), tx.object(REGISTRY_ID), aCoin, tx.pure.u64(0), tx.object(CLOCK_ID)]
+        });
+        tx.transferObjects([out], sender);
+      }
+      tx.setGasBudget(20_000_000);
 
     } else if (action === 'add_liquidity') {
       if (!suiAmount || !agentAmount) return res.status(400).json({ error: 'suiAmount and agentAmount required' });
@@ -630,4 +670,32 @@ app.listen(PORT, () => {
   }
   // Start candle aggregator
   startCandlePoller();
+});
+
+// ══════════════════════════════════════════
+// CLAIM LP FEES — sends protocol fees to dev wallet
+// ══════════════════════════════════════════
+app.post('/lp/claim-fees', async (req, res) => {
+  const { adminKey } = req.body;
+  if (adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const keypair    = getAdminKeypair();
+    const devWallet  = keypair.toSuiAddress(); // fees go to admin/dev wallet
+    const tx         = new Transaction();
+    const [feeCoin]  = tx.moveCall({
+      target: `${LP_POOL_PACKAGE}::pool_lp::withdraw_protocol_fees`,
+      arguments: [tx.object(LP_POOL_ID), tx.object(LP_ADMIN_CAP)]
+    });
+    tx.transferObjects([feeCoin], devWallet);
+    tx.setGasBudget(10_000_000);
+    const result = await client.signAndExecuteTransaction({
+      signer: keypair, transaction: tx, options: { showEffects: true }
+    });
+    if (result.effects?.status?.status === 'success') {
+      console.log(`✅ LP fees claimed to dev wallet: ${result.digest}`);
+      res.json({ success: true, txDigest: result.digest, recipient: devWallet });
+    } else {
+      res.json({ success: false, error: result.effects?.status?.error });
+    }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
