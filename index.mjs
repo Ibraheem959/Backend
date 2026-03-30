@@ -21,13 +21,12 @@ const TOKEN_PACKAGE  = '0x5613a7e1f4f8fc7b896781aaba9b52944763e14421458d14c82922
 const TOKEN_ADMIN_CAP = process.env.ADMIN_CAP_ID || '0x3a202c081798cf0781b13d0bbe9efdf3a95a1d94cd901cdbcd51d9f8745eed10';
 const REGISTRY_ID    = '0x63af8f92c3988601b889a543615b0984ebabbfa420d8b38b2461751f8c05194f';
 const POOL_ID        = '0xba79012088507127692c8c8ba97d4fdc4a83d2f9fff4e9a1ea61ebdc00ff460c';
-const POOL_PACKAGE   = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
-// LP Pool (set after deployment)
+const POOL_PACKAGE    = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
+const CLOCK_ID        = '0x0000000000000000000000000000000000000000000000000000000000000006';
+// LP Pool
 const LP_POOL_ID      = process.env.LP_POOL_ID      || null;
 const LP_POOL_PACKAGE = process.env.LP_POOL_PACKAGE || null;
 const LP_ADMIN_CAP    = process.env.LP_ADMIN_CAP    || null;
-const POOL_PACKAGE   = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
-const CLOCK_ID       = '0x0000000000000000000000000000000000000000000000000000000000000006';
 const ARENA_PACKAGE  = '0xac38870890071543644ea81d1f5fe8000d45030c266c82c24c26eccbf0c239db';
 const ARENA_OBJECT   = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
 const ARENA_ADMIN_CAP= '0x81d63f7fecfab19b5409c29dead1e695a349f56e29269d03980ebfad64442695';
@@ -393,6 +392,47 @@ app.post('/pool/add-liquidity', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// SWAP — get quote for buying/selling $AGENT
+// ══════════════════════════════════════════
+app.get('/swap/quote', async (req, res) => {
+  const { type, amount } = req.query; // type: buy|sell, amount in SUI or AGENT
+  if (!type || !amount) return res.status(400).json({ error: 'type and amount required' });
+  try {
+    const obj = await client.getObject({ id: POOL_ID, options: { showContent: true } });
+    const f   = obj.data?.content?.fields || {};
+    const suiRes   = parseInt(f.sui_reserve?.fields?.balance   || f.sui_reserve   || 0);
+    const agentRes = parseInt(f.agent_reserve?.fields?.balance || f.agent_reserve || 0);
+    const FEE_BPS  = 30;
+
+    if (type === 'buy') {
+      const suiIn    = Math.floor(parseFloat(amount) * 1e9);
+      const fee      = Math.floor(suiIn * FEE_BPS / 10000);
+      const suiNet   = suiIn - fee;
+      const agentOut = Math.floor((suiNet * agentRes) / (suiRes + suiNet));
+      res.json({
+        type: 'buy', suiIn,
+        agentOut, agentOutFormatted: (agentOut/1e6).toFixed(0),
+        fee, feeSui: (fee/1e9).toFixed(6),
+        priceImpact: ((suiNet / suiRes) * 100).toFixed(3) + '%',
+        price: (suiIn/1e9) / (agentOut/1e6),
+      });
+    } else {
+      const agentIn  = Math.floor(parseFloat(amount) * 1e6);
+      const suiGross = Math.floor((agentIn * suiRes) / (agentRes + agentIn));
+      const fee      = Math.floor(suiGross * FEE_BPS / 10000);
+      const suiOut   = suiGross - fee;
+      res.json({
+        type: 'sell', agentIn,
+        suiOut, suiOutFormatted: (suiOut/1e9).toFixed(6),
+        fee, feeSui: (fee/1e9).toFixed(6),
+        priceImpact: ((agentIn / agentRes) * 100).toFixed(3) + '%',
+        price: (suiOut/1e9) / (agentIn/1e6),
+      });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
 // CANDLES — OHLCV from on-chain events
 // ══════════════════════════════════════════
 app.get('/candles', (req, res) => {
@@ -456,6 +496,110 @@ app.get('/lp/position/:wallet', async (req, res) => {
 
     res.json({ wallet, lpBalance: userLp, suiValue, agentValue, sharePct, lpTotal });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// BUILD-TX — build unsigned TX for wallet to sign
+// ══════════════════════════════════════════
+app.post('/build-tx', async (req, res) => {
+  const { sender, action, amount, badgeId, suiAmount, agentAmount, lpAmount } = req.body;
+  if (!sender || !action) return res.status(400).json({ error: 'sender and action required' });
+
+  try {
+    const tx = new Transaction();
+    tx.setSender(sender);
+
+    if (action === 'buy') {
+      // Buy $AGENT from official pool — requires AgentBadge
+      if (!badgeId) return res.status(400).json({ error: 'badgeId required for buy' });
+      const [coin] = tx.splitCoins(tx.gas, [amount]);
+      const [out]  = tx.moveCall({
+        target: `${POOL_PACKAGE}::pool::buy_agent_verified`,
+        arguments: [
+          tx.object(POOL_ID), tx.object(badgeId),
+          tx.object(REGISTRY_ID), coin,
+          tx.pure.u64(0), tx.object(CLOCK_ID)
+        ]
+      });
+      tx.transferObjects([out], sender);
+      tx.setGasBudget(15_000_000);
+
+    } else if (action === 'sell') {
+      // Sell $AGENT to official pool — requires AgentBadge
+      if (!badgeId) return res.status(400).json({ error: 'badgeId required for sell' });
+      const agentCoins = await client.getCoins({ owner: sender, coinType: COIN_TYPE });
+      if (!agentCoins.data.length) return res.status(400).json({ error: 'No $AGENT coins found' });
+      const primary = tx.object(agentCoins.data[0].coinObjectId);
+      if (agentCoins.data.length > 1) {
+        tx.mergeCoins(primary, agentCoins.data.slice(1).map(c => tx.object(c.coinObjectId)));
+      }
+      const [aCoin] = tx.splitCoins(primary, [amount]);
+      const [out]   = tx.moveCall({
+        target: `${POOL_PACKAGE}::pool::sell_agent_verified`,
+        arguments: [
+          tx.object(POOL_ID), tx.object(badgeId),
+          tx.object(REGISTRY_ID), aCoin,
+          tx.pure.u64(0), tx.object(CLOCK_ID)
+        ]
+      });
+      tx.transferObjects([out], sender);
+      tx.setGasBudget(15_000_000);
+
+    } else if (action === 'add_liquidity') {
+      if (!suiAmount || !agentAmount) return res.status(400).json({ error: 'suiAmount and agentAmount required' });
+      // LP Pool add_liquidity
+      const agentCoins = await client.getCoins({ owner: sender, coinType: COIN_TYPE });
+      if (!agentCoins.data.length) return res.status(400).json({ error: 'No $AGENT coins' });
+      const [suiCoin]   = tx.splitCoins(tx.gas, [suiAmount]);
+      const primaryAg   = tx.object(agentCoins.data[0].coinObjectId);
+      if (agentCoins.data.length > 1) {
+        tx.mergeCoins(primaryAg, agentCoins.data.slice(1).map(c => tx.object(c.coinObjectId)));
+      }
+      const [agentCoin] = tx.splitCoins(primaryAg, [agentAmount]);
+      const [lpOut]     = tx.moveCall({
+        target: `${LP_POOL_PACKAGE}::pool_lp::add_liquidity`,
+        arguments: [
+          tx.object(LP_POOL_ID), suiCoin, agentCoin,
+          tx.pure.u64(0), tx.object(CLOCK_ID)
+        ]
+      });
+      tx.transferObjects([lpOut], sender);
+      tx.setGasBudget(20_000_000);
+
+    } else if (action === 'remove_liquidity') {
+      if (!lpAmount) return res.status(400).json({ error: 'lpAmount required' });
+      const LP_COIN_TYPE = LP_POOL_PACKAGE ? `${LP_POOL_PACKAGE}::pool_lp::POOL_LP` : null;
+      if (!LP_COIN_TYPE) return res.status(400).json({ error: 'LP pool not configured' });
+      const lpCoins = await client.getCoins({ owner: sender, coinType: LP_COIN_TYPE });
+      if (!lpCoins.data.length) return res.status(400).json({ error: 'No LP tokens found' });
+      const primaryLp = tx.object(lpCoins.data[0].coinObjectId);
+      if (lpCoins.data.length > 1) {
+        tx.mergeCoins(primaryLp, lpCoins.data.slice(1).map(c => tx.object(c.coinObjectId)));
+      }
+      const [lpCoin]  = tx.splitCoins(primaryLp, [lpAmount]);
+      const [suiOut, agentOut] = tx.moveCall({
+        target: `${LP_POOL_PACKAGE}::pool_lp::remove_liquidity`,
+        arguments: [
+          tx.object(LP_POOL_ID), lpCoin,
+          tx.pure.u64(0), tx.pure.u64(0), tx.object(CLOCK_ID)
+        ]
+      });
+      tx.transferObjects([suiOut, agentOut], sender);
+      tx.setGasBudget(20_000_000);
+
+    } else {
+      return res.status(400).json({ error: 'unknown action: ' + action });
+    }
+
+    // Serialize TX for wallet to sign
+    const txBytes = await tx.build({ client });
+    const txBase64 = Buffer.from(txBytes).toString('base64');
+    res.json({ success: true, txBytes: txBase64, action });
+
+  } catch(e) {
+    console.error('build-tx error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ══════════════════════════════════════════
