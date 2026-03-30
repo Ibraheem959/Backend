@@ -3,6 +3,7 @@ import { SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Transaction } from '@mysten/sui/transactions';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -14,15 +15,16 @@ app.use((req, res, next) => {
 });
 
 // ─── CONTRACT ADDRESSES ───
-const TOKEN_PACKAGE = '0x5613a7e1f4f8fc7b896781aaba9b52944763e14421458d14c829223541d77c1c';
-const REGISTRY_ID   = '0x63af8f92c3988601b889a543615b0984ebabbfa420d8b38b2461751f8c05194f';
-const POOL_ID       = '0xba79012088507127692c8c8ba97d4fdc4a83d2f9fff4e9a1ea61ebdc00ff460c';
-const POOL_PACKAGE  = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
-const CLOCK_ID      = '0x0000000000000000000000000000000000000000000000000000000000000006';
-const ARENA_PACKAGE = '0xac38870890071543644ea81d1f5fe8000d45030c266c82c24c26eccbf0c239db';
-const ARENA_ID      = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
-const ARENA_ADMIN_CAP = '0x81d63f7fecfab19b5409c29dead1e695a349f56e29269d03980ebfad64442695';
-const COIN_TYPE     = `${TOKEN_PACKAGE}::agent::AGENT`;
+const TOKEN_PACKAGE  = '0x5613a7e1f4f8fc7b896781aaba9b52944763e14421458d14c829223541d77c1c';
+const TOKEN_ADMIN_CAP = process.env.ADMIN_CAP_ID || '0x3a202c081798cf0781b13d0bbe9efdf3a95a1d94cd901cdbcd51d9f8745eed10';
+const REGISTRY_ID    = '0x63af8f92c3988601b889a543615b0984ebabbfa420d8b38b2461751f8c05194f';
+const POOL_ID        = '0xba79012088507127692c8c8ba97d4fdc4a83d2f9fff4e9a1ea61ebdc00ff460c';
+const POOL_PACKAGE   = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
+const CLOCK_ID       = '0x0000000000000000000000000000000000000000000000000000000000000006';
+const ARENA_PACKAGE  = '0xac38870890071543644ea81d1f5fe8000d45030c266c82c24c26eccbf0c239db';
+const ARENA_OBJECT   = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
+const ARENA_ADMIN_CAP= '0x81d63f7fecfab19b5409c29dead1e695a349f56e29269d03980ebfad64442695';
+const COIN_TYPE      = `${TOKEN_PACKAGE}::agent::AGENT`;
 
 const client = new SuiClient({ url: 'https://fullnode.mainnet.sui.io:443' });
 
@@ -33,15 +35,34 @@ function getAdminKeypair() {
   return Ed25519Keypair.fromSecretKey(secretKey);
 }
 
-// ─── CURRENT ROUND TRACKING ───
-// Updated by /arena/set-round endpoint or CURRENT_ROUND_ID env var
-let currentRoundId = process.env.CURRENT_ROUND_ID || null;
+// ─── CURRENT ROUND ───
+let currentRoundId = process.env.CURRENT_ROUND_ID || '0x1e0b8b0fc3b79ec750bb258df0eca82f80a194d79229d2f1ec798ba28c6f6c45';
 
-// ─── KEEP ALIVE PING ───
+// ─── PARTICIPANT STORE ───
+const PARTICIPANTS_FILE = './arena-participants.json';
+function loadParticipants() {
+  try { return existsSync(PARTICIPANTS_FILE) ? JSON.parse(readFileSync(PARTICIPANTS_FILE, 'utf8')) : {}; }
+  catch { return {}; }
+}
+function saveParticipants(data) { writeFileSync(PARTICIPANTS_FILE, JSON.stringify(data, null, 2)); }
+
+// ─── KEEP ALIVE ───
 if (process.env.RENDER_EXTERNAL_URL) {
-  setInterval(() => {
-    fetch(process.env.RENDER_EXTERNAL_URL).catch(() => {});
-  }, 14 * 60 * 1000); // ping every 14 mins to prevent sleep
+  setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL).catch(() => {}); }, 14 * 60 * 1000);
+}
+
+// ─── NOTIFY TELEGRAM ───
+async function notify(msg) {
+  const token  = process.env.TG_BUYBOT_TOKEN;
+  const chatId = process.env.TG_CHANNEL_ID;
+  if (!token || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' })
+    });
+  } catch(e) { console.error('TG notify error:', e.message); }
 }
 
 // ══════════════════════════════════════════
@@ -51,26 +72,28 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: '$AGENT Backend',
-    version: '2.0.0',
+    version: '3.0.0',
     currentRound: currentRoundId,
     contracts: {
-      token:    TOKEN_PACKAGE,
-      pool:     POOL_PACKAGE,
-      registry: REGISTRY_ID,
-      arena:    ARENA_PACKAGE,
+      token:        TOKEN_PACKAGE,
+      tokenAdminCap: TOKEN_ADMIN_CAP,
+      registry:     REGISTRY_ID,
+      pool:         POOL_PACKAGE,
+      arenaPackage: ARENA_PACKAGE,
+      arenaObject:  ARENA_OBJECT,
     }
   });
 });
 
 // ══════════════════════════════════════════
-// WALLET REGISTRATION — mint AgentBadge
+// REGISTER — mint AgentBadge (correct args)
 // ══════════════════════════════════════════
 app.post('/register', async (req, res) => {
   const { wallet } = req.body;
   if (!wallet) return res.status(400).json({ success: false, error: 'wallet address required' });
 
   try {
-    // Check if already registered
+    // Check if already has badge
     const existing = await client.getOwnedObjects({
       owner: wallet,
       filter: { StructType: `${TOKEN_PACKAGE}::agent::AgentBadge` },
@@ -85,17 +108,23 @@ app.post('/register', async (req, res) => {
       });
     }
 
-    const keypair = getAdminKeypair();
+    // Mint new badge
+    // register_agent(registry, _admin_cap, agent_address, skill_hash, clock, ctx)
+    const keypair      = getAdminKeypair();
+    const skillHashBytes = Array.from(Buffer.from('default-agent-skill', 'utf8'));
     const tx = new Transaction();
     tx.moveCall({
       target: `${TOKEN_PACKAGE}::agent::register_agent`,
       arguments: [
-        tx.object(REGISTRY_ID),
-        tx.pure.address(wallet),
-        tx.object(CLOCK_ID)
+        tx.object(REGISTRY_ID),           // registry
+        tx.object(TOKEN_ADMIN_CAP),       // _admin_cap
+        tx.pure.address(wallet),          // agent_address
+        tx.pure.vector('u8', skillHashBytes), // skill_hash
+        tx.object(CLOCK_ID),              // clock
       ]
     });
     tx.setGasBudget(10_000_000);
+
     const result = await client.signAndExecuteTransaction({
       signer: keypair, transaction: tx,
       options: { showEffects: true, showObjectChanges: true }
@@ -105,17 +134,20 @@ app.post('/register', async (req, res) => {
       const badge = result.objectChanges?.find(o =>
         o.type === 'created' && o.objectType?.includes('AgentBadge')
       );
-      res.json({ success: true, badgeId: badge?.objectId, tx: result.digest, wallet });
+      console.log(`✅ Badge minted for ${wallet} — TX: ${result.digest}`);
+      res.json({ success: true, badgeId: badge?.objectId, txDigest: result.digest, wallet });
     } else {
+      console.error(`❌ Badge mint failed for ${wallet}:`, result.effects?.status?.error);
       res.json({ success: false, error: result.effects?.status?.error });
     }
   } catch(e) {
+    console.error('Registration error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // ══════════════════════════════════════════
-// WALLET STATUS — check registration
+// STATUS — check wallet registration
 // ══════════════════════════════════════════
 app.get('/status/:wallet', async (req, res) => {
   const { wallet } = req.params;
@@ -127,27 +159,20 @@ app.get('/status/:wallet', async (req, res) => {
     });
     const registered = objects.data.length > 0;
     const badgeId    = registered ? objects.data[0].data.objectId : null;
-
-    // Get balances
-    const suiBal   = await client.getBalance({ owner: wallet });
-    const agentBal = await client.getBalance({ owner: wallet, coinType: COIN_TYPE }).catch(() => ({ totalBalance: '0' }));
-
+    const suiBal     = await client.getBalance({ owner: wallet });
+    const agentBal   = await client.getBalance({ owner: wallet, coinType: COIN_TYPE }).catch(() => ({ totalBalance: '0' }));
     res.json({
-      registered,
-      badgeId,
-      wallet,
+      registered, badgeId, wallet,
       balances: {
-        sui:   (parseInt(suiBal.totalBalance) / 1e9).toFixed(4),
+        sui:   (parseInt(suiBal.totalBalance)   / 1e9).toFixed(4),
         agent: (parseInt(agentBal.totalBalance) / 1e6).toFixed(0)
       }
     });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════
-// POOL STATS — live price and reserves
+// POOL — live price and reserves
 // ══════════════════════════════════════════
 app.get('/pool', async (req, res) => {
   try {
@@ -156,46 +181,15 @@ app.get('/pool', async (req, res) => {
     const sui   = parseInt(f.sui_reserve?.fields?.balance   || f.sui_reserve   || 0);
     const agent = parseInt(f.agent_reserve?.fields?.balance || f.agent_reserve || 0);
     const price = agent > 0 ? (sui / 1e9) / (agent / 1e6) : 0;
-    const SUI_USD = parseFloat(process.env.SUI_USD_PRICE || '1.78');
-
     res.json({
-      suiReserve:      sui,
-      agentReserve:    agent,
+      suiReserve:   sui,
+      agentReserve: agent,
       price,
-      priceFormatted:  price.toFixed(10),
-      priceUsd:        (price * SUI_USD).toFixed(12),
-      suiFormatted:    (sui/1e9).toFixed(2),
-      agentFormatted:  (agent/1e6).toFixed(0),
-      liquidity:       ((sui/1e9) * SUI_USD * 2).toFixed(2),
-      marketCap:       (1_000_000_000 * price * SUI_USD).toFixed(2),
+      priceFormatted: price.toFixed(10),
+      suiFormatted:   (sui/1e9).toFixed(2),
+      agentFormatted: (agent/1e6).toFixed(0),
     });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ══════════════════════════════════════════
-// TRADES — recent pool trades
-// ══════════════════════════════════════════
-app.get('/trades', async (req, res) => {
-  try {
-    const events = await client.queryEvents({
-      query: { MoveModule: { package: POOL_PACKAGE, module: 'pool' } },
-      limit: 20,
-      order: 'descending'
-    });
-    const trades = events.data.map(e => ({
-      type:      e.type?.includes('Buy') ? 'buy' : 'sell',
-      wallet:    e.parsedJson?.buyer || e.parsedJson?.seller || '0x0000',
-      suiAmount: e.parsedJson?.sui_in || e.parsedJson?.sui_out || 0,
-      agentAmount: e.parsedJson?.agent_out || e.parsedJson?.agent_in || 0,
-      timestamp: e.timestampMs,
-      tx:        e.id?.txDigest
-    }));
-    res.json({ trades, count: trades.length });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════
@@ -203,10 +197,8 @@ app.get('/trades', async (req, res) => {
 // ══════════════════════════════════════════
 app.get('/arena', async (req, res) => {
   try {
-    // Get arena global state
-    const arenaObj = await client.getObject({ id: ARENA_ID, options: { showContent: true } });
+    const arenaObj = await client.getObject({ id: ARENA_OBJECT, options: { showContent: true } });
     const arenaFields = arenaObj.data?.content?.fields || {};
-
     let roundData = null;
     if (currentRoundId) {
       const roundObj = await client.getObject({ id: currentRoundId, options: { showContent: true } });
@@ -214,13 +206,14 @@ app.get('/arena', async (req, res) => {
       const stateMap = { '0': 'open', '1': 'active', '2': 'ended' };
       const endTime  = parseInt(f.end_time || 0);
       const now      = Date.now();
-
+      const prizeRaw = parseInt(f.prize_pool?.fields?.value || f.prize_pool || 0);
       roundData = {
         roundId:      currentRoundId,
         roundNumber:  parseInt(f.round_number || 0),
         state:        stateMap[f.state] || f.state,
         activeAgents: parseInt(f.active_count || 0),
-        prizePool:    (parseInt(f.prize_pool?.fields?.value || f.prize_pool || 0) / 1e9).toFixed(4),
+        prizePool:    (prizeRaw / 1_000_000).toFixed(0) + ' $AGENT',
+        prizeRaw,
         startTime:    parseInt(f.start_time || 0),
         endTime,
         timeRemaining: endTime > now ? endTime - now : 0,
@@ -228,116 +221,115 @@ app.get('/arena', async (req, res) => {
         prizeClaimed: f.prize_claimed || false,
       };
     }
-
-    res.json({
-      arenaId:      ARENA_ID,
-      totalRounds:  parseInt(arenaFields.current_round || 0),
-      currentRound: roundData,
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+    res.json({ arenaId: ARENA_OBJECT, totalRounds: parseInt(arenaFields.current_round || 0), currentRound: roundData });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════
-// ARENA — get any round by ID
+// ARENA — register participant from site/bot
 // ══════════════════════════════════════════
-app.get('/arena/round/:roundId', async (req, res) => {
-  const { roundId } = req.params;
+app.post('/arena/register-participant', async (req, res) => {
+  const { wallet, telegram, strategy, settings, roundId } = req.body;
+  if (!wallet) return res.status(400).json({ success: false, error: 'wallet required' });
+  if (!strategy) return res.status(400).json({ success: false, error: 'strategy required' });
+
   try {
-    const roundObj = await client.getObject({ id: roundId, options: { showContent: true } });
-    const f = roundObj.data?.content?.fields || {};
-    const stateMap = { '0': 'open', '1': 'active', '2': 'ended' };
-    const endTime  = parseInt(f.end_time || 0);
-    const now      = Date.now();
+    const participants = loadParticipants();
+    const roundKey = roundId || currentRoundId || 'current';
+    if (!participants[roundKey]) participants[roundKey] = [];
 
-    res.json({
-      roundId,
-      roundNumber:  parseInt(f.round_number || 0),
-      state:        stateMap[f.state] || f.state,
-      activeAgents: parseInt(f.active_count || 0),
-      prizePool:    (parseInt(f.prize_pool?.fields?.value || f.prize_pool || 0) / 1e9).toFixed(4),
-      startTime:    parseInt(f.start_time || 0),
-      endTime,
-      timeRemaining: endTime > now ? endTime - now : 0,
-      winner:       f.winner?.fields?.vec?.[0] || null,
-      prizeClaimed: f.prize_claimed || false,
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+    const existing = participants[roundKey].find(p => p.wallet === wallet);
+    if (existing) return res.json({ success: true, alreadyRegistered: true, participant: existing });
+
+    const STRAT_DEFAULTS = {
+      scalper:      { buyAmount:'0.1', buyDrop:'2',  takeProfit:'8',  stopLoss:'3'  },
+      swing:        { buyAmount:'0.3', buyDrop:'5',  takeProfit:'20', stopLoss:'8'  },
+      conservative: { buyAmount:'0.1', buyDrop:'10', takeProfit:'15', stopLoss:'5'  },
+      degen:        { buyAmount:'0.5', buyDrop:'1',  takeProfit:'50', stopLoss:'15' },
+      auto:         { buyAmount:'0.1', buyDrop:'3',  takeProfit:'20', stopLoss:'8'  },
+    };
+    const def = STRAT_DEFAULTS[strategy] || STRAT_DEFAULTS.swing;
+
+    const participant = {
+      wallet, telegram: telegram || null, strategy,
+      settings: {
+        buyAmount:  settings?.buyAmount  || def.buyAmount,
+        buyDrop:    settings?.buyDrop    || def.buyDrop,
+        takeProfit: settings?.takeProfit || def.takeProfit,
+        stopLoss:   settings?.stopLoss   || def.stopLoss,
+      },
+      registeredAt: Date.now(),
+      eliminated: false, pnl: 0,
+    };
+
+    participants[roundKey].push(participant);
+    saveParticipants(participants);
+
+    const count = participants[roundKey].length;
+    await notify(
+      `🏟 *New Arena Registration!*\n\n` +
+      `Agent: \`${wallet.slice(0,8)}...${wallet.slice(-6)}\`\n` +
+      `Strategy: ${strategy.toUpperCase()}\n` +
+      `Agents: ${count}/10\n\n` +
+      (count >= 10 ? `⚡ *10 agents — round starting!*` : `Need ${10 - count} more`)
+    );
+
+    res.json({ success: true, participant, totalRegistered: count });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ══════════════════════════════════════════
-// ARENA — set current round (admin only)
+// ARENA — get participants
+// ══════════════════════════════════════════
+app.get('/arena/participants', async (req, res) => {
+  const roundId = req.query.round || currentRoundId || 'current';
+  try {
+    const participants = loadParticipants();
+    const list = (participants[roundId] || []).map(p => ({
+      wallet: p.wallet, strategy: p.strategy,
+      eliminated: p.eliminated, pnl: p.pnl, registeredAt: p.registeredAt,
+    }));
+    res.json({ participants: list, count: list.length, roundId });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// ARENA — get winner
+// ══════════════════════════════════════════
+app.get('/arena/winner', async (req, res) => {
+  const roundId = req.query.round || currentRoundId || 'current';
+  try {
+    const participants = loadParticipants();
+    const list  = participants[roundId] || [];
+    const alive = list.filter(p => !p.eliminated);
+    if (alive.length === 1) return res.json({ winner: alive[0], reason: 'last_standing' });
+    if (alive.length > 1) {
+      const winner = alive.sort((a,b) => b.pnl - a.pnl)[0];
+      return res.json({ winner, reason: 'highest_pnl', survivors: alive.length });
+    }
+    const last = list.sort((a,b) => (b.eliminatedAt||0) - (a.eliminatedAt||0))[0];
+    return res.json({ winner: last || null, reason: 'last_eliminated' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// ARENA — set round (admin)
 // ══════════════════════════════════════════
 app.post('/arena/set-round', async (req, res) => {
   const { roundId, adminKey } = req.body;
-  if (adminKey !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'unauthorized' });
   if (!roundId) return res.status(400).json({ error: 'roundId required' });
   currentRoundId = roundId;
   res.json({ success: true, currentRound: currentRoundId });
 });
 
 // ══════════════════════════════════════════
-// ARENA — check if wallet is registered in round
+// START SERVER
 // ══════════════════════════════════════════
-app.get('/arena/check/:wallet', async (req, res) => {
-  const { wallet } = req.params;
-  const roundId = req.query.round || currentRoundId;
-  if (!roundId) return res.status(400).json({ error: 'no active round' });
-
-  try {
-    const roundObj = await client.getObject({ id: roundId, options: { showContent: true } });
-    const f = roundObj.data?.content?.fields || {};
-    const stateMap = { '0': 'open', '1': 'active', '2': 'ended' };
-
-    res.json({
-      roundId,
-      wallet,
-      roundState: stateMap[f.state] || f.state,
-      activeAgents: parseInt(f.active_count || 0),
-      prizePool: (parseInt(f.prize_pool?.fields?.value || 0) / 1e9).toFixed(4),
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ══════════════════════════════════════════
-// STATS — overall project stats
-// ══════════════════════════════════════════
-app.get('/stats', async (req, res) => {
-  try {
-    const [registryObj, poolObj] = await Promise.all([
-      client.getObject({ id: REGISTRY_ID, options: { showContent: true } }),
-      client.getObject({ id: POOL_ID, options: { showContent: true } }),
-    ]);
-
-    const rf = registryObj.data?.content?.fields || {};
-    const pf = poolObj.data?.content?.fields || {};
-
-    const sui   = parseInt(pf.sui_reserve?.fields?.balance   || pf.sui_reserve   || 0);
-    const agent = parseInt(pf.agent_reserve?.fields?.balance || pf.agent_reserve || 0);
-    const price = agent > 0 ? (sui / 1e9) / (agent / 1e6) : 0;
-
-    res.json({
-      registeredAgents: parseInt(rf.agent_count || rf.total_agents || 0),
-      totalTrades:      parseInt(rf.total_trades || 0),
-      totalVolumeSui:   parseFloat(rf.total_volume || 0) / 1e9,
-      price,
-      poolSui:          (sui/1e9).toFixed(2),
-      poolAgent:        (agent/1e6).toFixed(0),
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.listen(PORT, () => {
   console.log(`$AGENT Backend running on port ${PORT}`);
-  console.log(`Arena Package: ${ARENA_PACKAGE}`);
-  console.log(`Current Round: ${currentRoundId || 'none'}`);
+  console.log(`Admin cap: ${TOKEN_ADMIN_CAP}`);
+  console.log(`Registry:  ${REGISTRY_ID}`);
+  console.log(`Arena:     ${ARENA_PACKAGE}`);
+  console.log(`Round:     ${currentRoundId}`);
 });
