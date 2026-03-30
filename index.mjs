@@ -5,6 +5,7 @@ import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Transaction } from '@mysten/sui/transactions';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { startArenaMonitor } from './arena-monitor.mjs';
+import { startCandlePoller, getCandles, setSuiPrice } from './candles.mjs';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -20,6 +21,11 @@ const TOKEN_PACKAGE  = '0x5613a7e1f4f8fc7b896781aaba9b52944763e14421458d14c82922
 const TOKEN_ADMIN_CAP = process.env.ADMIN_CAP_ID || '0x3a202c081798cf0781b13d0bbe9efdf3a95a1d94cd901cdbcd51d9f8745eed10';
 const REGISTRY_ID    = '0x63af8f92c3988601b889a543615b0984ebabbfa420d8b38b2461751f8c05194f';
 const POOL_ID        = '0xba79012088507127692c8c8ba97d4fdc4a83d2f9fff4e9a1ea61ebdc00ff460c';
+const POOL_PACKAGE   = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
+// LP Pool (set after deployment)
+const LP_POOL_ID      = process.env.LP_POOL_ID      || null;
+const LP_POOL_PACKAGE = process.env.LP_POOL_PACKAGE || null;
+const LP_ADMIN_CAP    = process.env.LP_ADMIN_CAP    || null;
 const POOL_PACKAGE   = '0x3599b83bfc78a1e13baa256b35c340b34111ac18dab3736732efb48ce3cd6952';
 const CLOCK_ID       = '0x0000000000000000000000000000000000000000000000000000000000000006';
 const ARENA_PACKAGE  = '0xac38870890071543644ea81d1f5fe8000d45030c266c82c24c26eccbf0c239db';
@@ -314,6 +320,145 @@ app.get('/arena/winner', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// POOL — add liquidity (admin only)
+// ══════════════════════════════════════════
+app.post('/pool/add-liquidity', async (req, res) => {
+  const { suiAmount, agentAmount, adminKey } = req.body;
+  if (adminKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (!suiAmount || !agentAmount) {
+    return res.status(400).json({ error: 'suiAmount and agentAmount required' });
+  }
+
+  try {
+    const keypair    = getAdminKeypair();
+    const sender     = keypair.toSuiAddress();
+
+    // suiAmount in SUI (e.g. 10), agentAmount in $AGENT (e.g. 1000000)
+    const suiRaw   = Math.floor(parseFloat(suiAmount)   * 1_000_000_000); // SUI → MIST
+    const agentRaw = Math.floor(parseFloat(agentAmount) * 1_000_000);     // $AGENT → raw
+
+    // Get SUI coins
+    const suiCoins = await client.getCoins({ owner: sender });
+    if (!suiCoins.data.length) return res.status(400).json({ error: 'No SUI coins in admin wallet' });
+
+    // Get $AGENT coins
+    const agentCoins = await client.getCoins({ owner: sender, coinType: COIN_TYPE });
+    if (!agentCoins.data.length) return res.status(400).json({ error: 'No $AGENT coins in admin wallet' });
+
+    const tx = new Transaction();
+
+    // Split exact SUI amount
+    const [suiCoin] = tx.splitCoins(tx.gas, [suiRaw]);
+
+    // Merge and split exact $AGENT amount
+    const primaryAgent = tx.object(agentCoins.data[0].coinObjectId);
+    if (agentCoins.data.length > 1) {
+      tx.mergeCoins(primaryAgent, agentCoins.data.slice(1).map(c => tx.object(c.coinObjectId)));
+    }
+    const [agentCoin] = tx.splitCoins(primaryAgent, [agentRaw]);
+
+    // Call add_liquidity(pool, admin_cap, sui_coin, agent_coin)
+    tx.moveCall({
+      target: `${POOL_PACKAGE}::pool::add_liquidity`,
+      arguments: [
+        tx.object(POOL_ID),
+        tx.object(TOKEN_ADMIN_CAP),
+        suiCoin,
+        agentCoin,
+      ]
+    });
+    tx.setGasBudget(20_000_000);
+
+    const result = await client.signAndExecuteTransaction({
+      signer: keypair, transaction: tx,
+      options: { showEffects: true }
+    });
+
+    if (result.effects?.status?.status === 'success') {
+      console.log(`✅ Liquidity added: ${suiAmount} SUI + ${agentAmount} $AGENT — TX: ${result.digest}`);
+      res.json({
+        success: true,
+        txDigest: result.digest,
+        added: { sui: suiAmount, agent: agentAmount }
+      });
+    } else {
+      res.json({ success: false, error: result.effects?.status?.error });
+    }
+  } catch(e) {
+    console.error('Add liquidity error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════
+// CANDLES — OHLCV from on-chain events
+// ══════════════════════════════════════════
+app.get('/candles', (req, res) => {
+  const tf    = req.query.tf    || '5m';
+  const limit = parseInt(req.query.limit || '200');
+  const valid = ['1m','5m','15m','1h','4h','1d'];
+  if (!valid.includes(tf)) return res.status(400).json({ error: 'invalid timeframe' });
+  const candles = getCandles(tf, limit);
+  res.json({ candles, tf, count: candles.length });
+});
+
+// ══════════════════════════════════════════
+// LP POOL — add liquidity (user signs tx client-side)
+// Returns unsigned tx bytes for wallet to sign
+// ══════════════════════════════════════════
+app.get('/lp/pool', async (req, res) => {
+  if (!LP_POOL_ID) return res.status(503).json({ error: 'LP pool not deployed yet' });
+  try {
+    const obj = await client.getObject({ id: LP_POOL_ID, options: { showContent: true } });
+    const f   = obj.data?.content?.fields || {};
+    const sui       = parseInt(f.sui_reserve?.fields?.balance   || f.sui_reserve   || 0);
+    const agent     = parseInt(f.agent_reserve?.fields?.balance || f.agent_reserve || 0);
+    const lpTotal   = parseInt(f.lp_supply?.fields?.value       || 0);
+    const price     = agent > 0 ? (sui / 1e9) / (agent / 1e6) : 0;
+    res.json({
+      poolId:       LP_POOL_ID,
+      suiReserve:   sui,
+      agentReserve: agent,
+      lpTotal,
+      price,
+      priceFormatted: price.toFixed(12),
+      suiFormatted:   (sui/1e9).toFixed(4),
+      agentFormatted: (agent/1e6).toFixed(0),
+      feeBps:  parseInt(f.fee_bps      || 30),
+      paused:  f.is_paused || false,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/lp/position/:wallet', async (req, res) => {
+  if (!LP_POOL_ID) return res.status(503).json({ error: 'LP pool not deployed yet' });
+  const { wallet } = req.params;
+  try {
+    // Get user's LP token balance
+    const LP_COIN_TYPE = LP_POOL_PACKAGE ? `${LP_POOL_PACKAGE}::pool_lp::LP` : null;
+    if (!LP_COIN_TYPE) return res.json({ lpBalance: 0, suiValue: 0, agentValue: 0 });
+
+    const lpBal = await client.getBalance({ owner: wallet, coinType: LP_COIN_TYPE }).catch(() => ({ totalBalance: '0' }));
+    const userLp = parseInt(lpBal.totalBalance);
+
+    // Get pool state to compute share value
+    const poolObj = await client.getObject({ id: LP_POOL_ID, options: { showContent: true } });
+    const f       = poolObj.data?.content?.fields || {};
+    const sui     = parseInt(f.sui_reserve?.fields?.balance   || 0);
+    const agent   = parseInt(f.agent_reserve?.fields?.balance || 0);
+    const lpTotal = parseInt(f.lp_supply?.fields?.value       || 0) + userLp;
+
+    const suiValue   = lpTotal > 0 ? Math.floor(userLp * sui   / lpTotal) : 0;
+    const agentValue = lpTotal > 0 ? Math.floor(userLp * agent / lpTotal) : 0;
+    const sharePct   = lpTotal > 0 ? (userLp / lpTotal * 100).toFixed(4) : '0';
+
+    res.json({ wallet, lpBalance: userLp, suiValue, agentValue, sharePct, lpTotal });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
 // ARENA — set round (admin)
 // ══════════════════════════════════════════
 app.post('/arena/set-round', async (req, res) => {
@@ -333,9 +478,12 @@ app.listen(PORT, () => {
   console.log(`Registry:  ${REGISTRY_ID}`);
   console.log(`Arena:     ${ARENA_PACKAGE}`);
   console.log(`Round:     ${currentRoundId}`);
-  // Auto start arena monitor
+  console.log(`LP Pool:   ${LP_POOL_ID || 'not deployed yet'}`);
+  // Start arena monitor
   if (currentRoundId) {
     startArenaMonitor(currentRoundId).catch(e => console.error('Monitor error:', e.message));
     console.log('🏟 Arena monitor started');
   }
+  // Start candle aggregator
+  startCandlePoller();
 });
