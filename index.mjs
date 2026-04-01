@@ -456,7 +456,7 @@ app.get('/lp/pool', async (req, res) => {
     const f   = obj.data?.content?.fields || {};
     const sui       = parseInt(f.sui_reserve?.fields?.balance   || f.sui_reserve   || 0);
     const agent     = parseInt(f.agent_reserve?.fields?.balance || f.agent_reserve || 0);
-    const lpTotal   = parseInt(f.lp_supply?.fields?.value       || 0);
+    const lpTotal   = parseInt(f.lp_total || 0);
     const price     = agent > 0 ? (sui / 1e9) / (agent / 1e6) : 0;
     res.json({
       poolId:       LP_POOL_ID,
@@ -478,7 +478,7 @@ app.get('/lp/position/:wallet', async (req, res) => {
   const { wallet } = req.params;
   try {
     // Get user's LP token balance
-    const LP_COIN_TYPE = LP_POOL_PACKAGE ? `${LP_POOL_PACKAGE}::pool_lp::LP` : null;
+    const LP_COIN_TYPE = LP_POOL_PACKAGE ? `${LP_POOL_PACKAGE}::pool_lp::POOL_LP` : null;
     if (!LP_COIN_TYPE) return res.json({ lpBalance: 0, suiValue: 0, agentValue: 0 });
 
     const lpBal = await client.getBalance({ owner: wallet, coinType: LP_COIN_TYPE }).catch(() => ({ totalBalance: '0' }));
@@ -489,7 +489,7 @@ app.get('/lp/position/:wallet', async (req, res) => {
     const f       = poolObj.data?.content?.fields || {};
     const sui     = parseInt(f.sui_reserve?.fields?.balance   || 0);
     const agent   = parseInt(f.agent_reserve?.fields?.balance || 0);
-    const lpTotal = parseInt(f.lp_supply?.fields?.value       || 0) + userLp;
+    const lpTotal = parseInt(f.lp_total || 0);
 
     const suiValue   = lpTotal > 0 ? Math.floor(userLp * sui   / lpTotal) : 0;
     const agentValue = lpTotal > 0 ? Math.floor(userLp * agent / lpTotal) : 0;
