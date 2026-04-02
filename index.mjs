@@ -884,32 +884,34 @@ app.get('/users/load', (req, res) => {
 // Remove this endpoint after winner claims
 // ══════════════════════════════════════════
 app.post('/arena/set-winner-round', (req, res) => {
-  const { wallet, roundId, adminKey } = req.body;
+  const { wallet, chatId, roundId, adminKey } = req.body;
   if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  if (!wallet || !roundId) return res.status(400).json({ error: 'wallet and roundId required' });
+  if (!roundId) return res.status(400).json({ error: 'roundId required' });
 
-  // Search all users by wallet field
   let found = false;
-  for (const [id, u] of Object.entries(botUsers)) {
-    if (u.wallet && u.wallet.toLowerCase() === wallet.toLowerCase()) {
-      u.arenaRound = roundId;
-      found = true;
-      console.log('Set arenaRound for chatId', id, 'wallet', wallet);
+
+  // Set by chatId directly if provided
+  if (chatId && botUsers[chatId]) {
+    botUsers[chatId].arenaRound = roundId;
+    found = true;
+    console.log('Set arenaRound by chatId', chatId);
+  }
+
+  // Also set by wallet match
+  if (wallet) {
+    for (const [id, u] of Object.entries(botUsers)) {
+      if (u.wallet && u.wallet.toLowerCase() === wallet.toLowerCase()) {
+        u.arenaRound = roundId;
+        found = true;
+        console.log('Set arenaRound by wallet match, chatId', id);
+      }
     }
   }
 
-  // Force-inject if still not found — bot will merge on next /start
-  if (!found) {
-    const allWallets = Object.entries(botUsers).map(([id,u]) => id + ':' + u.wallet);
-    console.log('All users:', allWallets.join(' | '));
-    botUsers[wallet] = { wallet, arenaRound: roundId, step: 'complete', _forcedForClaim: true };
-    console.log('Force-injected arenaRound for wallet', wallet);
-  }
-
   saveBotUsers();
-  res.json({ success: true, found, message: found ? 'arenaRound set on existing user' : 'Force-injected — winner can claim now' });
+  res.json({ success: true, found, message: found ? 'arenaRound set — winner can claim now' : 'Not found' });
 });
 
 // TEMP — let winner claim by wallet address directly
