@@ -301,21 +301,56 @@ app.get('/arena/participants', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// ARENA — get winner
+// ARENA — get winner (only after 1hr round ends)
 // ══════════════════════════════════════════
 app.get('/arena/winner', async (req, res) => {
-  const roundId = req.query.round || currentRoundId || 'current';
+  const roundId = req.query.round || currentRoundId;
+  if (!roundId) return res.status(400).json({ error: 'roundId required' });
   try {
+    // Check on-chain if round has ended
+    let roundEnded = false;
+    try {
+      const obj = await client.getObject({ id: roundId, options: { showContent: true } });
+      const f   = obj.data?.content?.fields || {};
+      const endTime = parseInt(f.end_time || 0);
+      const state   = parseInt(f.state || 0);
+      roundEnded = (state === 2) || (endTime > 0 && Date.now() >= endTime);
+    } catch(e) { console.error('Round check:', e.message); }
+
+    if (!roundEnded) {
+      return res.json({ winner: null, reason: 'round_not_ended', message: 'Winner announced after 1 hour when round ends.' });
+    }
+
     const participants = loadParticipants();
     const list  = participants[roundId] || [];
     const alive = list.filter(p => !p.eliminated);
-    if (alive.length === 1) return res.json({ winner: alive[0], reason: 'last_standing' });
-    if (alive.length > 1) {
-      const winner = alive.sort((a,b) => b.pnl - a.pnl)[0];
-      return res.json({ winner, reason: 'highest_pnl', survivors: alive.length });
+
+    let winner, reason;
+    if (alive.length >= 1) {
+      winner = alive.sort((a,b) => (b.pnl||0) - (a.pnl||0))[0];
+      reason = alive.length === 1 ? 'last_standing' : 'highest_pnl';
+    } else {
+      winner = list.sort((a,b) => (b.eliminatedAt||0) - (a.eliminatedAt||0))[0];
+      reason = 'last_eliminated';
     }
-    const last = list.sort((a,b) => (b.eliminatedAt||0) - (a.eliminatedAt||0))[0];
-    return res.json({ winner: last || null, reason: 'last_eliminated' });
+
+    // Announce to TG channel once
+    if (winner && !winner.announcedWinner) {
+      winner.announcedWinner = true;
+      saveParticipants(participants);
+      await notify(
+        `🏆 *ARENA WINNER!*\n\n` +
+        `Winner: \`${winner.wallet?.slice(0,8)}...${winner.wallet?.slice(-6)}\`\n` +
+        `Strategy: ${(winner.strategy||'?').toUpperCase()}\n` +
+        `P&L: ${(winner.pnl||0).toFixed(2)}%\n\n` +
+        `💰 Claimable: 70% of prize pool\n` +
+        `🔥 15% burned | 💧 15% to LP\n\n` +
+        `Claim via @sui_agent_trader_bot\n` +
+        `🏟 suiagent.xyz`
+      );
+    }
+
+    return res.json({ winner: winner || null, reason, winnerPct: 0.70 });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -642,6 +677,110 @@ app.post('/build-tx', async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════
+// ARENA — eliminate participant (called by bot when SL hit)
+// ══════════════════════════════════════════
+app.post('/arena/eliminate-participant', async (req, res) => {
+  const { wallet, pnl, roundId, strategy } = req.body;
+  if (!wallet) return res.status(400).json({ error: 'wallet required' });
+  try {
+    const roundKey = roundId || currentRoundId || 'current';
+    const participants = loadParticipants();
+    const list = participants[roundKey] || [];
+    const p = list.find(x => x.wallet === wallet);
+    if (p) {
+      p.eliminated   = true;
+      p.eliminatedAt = Date.now();
+      p.pnl          = pnl || 0;
+      saveParticipants(participants);
+    }
+    const alive = list.filter(x => !x.eliminated).length;
+    // Notify TG channel
+    await notify(
+      `💀 *AGENT ELIMINATED!*\n\n` +
+      `Wallet: \`${wallet.slice(0,8)}...${wallet.slice(-6)}\`\n` +
+      `Strategy: ${(strategy||'?').toUpperCase()}\n` +
+      `Loss: ${(pnl||0).toFixed(2)}%\n\n` +
+      `Agents remaining: *${alive}*\n` +
+      `🏟 suiagent.xyz/#arena`
+    );
+    res.json({ success: true, alive, eliminated: wallet });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// ARENA — time up (called by bot when 1hr expires)
+// ══════════════════════════════════════════
+app.post('/arena/time-up', async (req, res) => {
+  const { wallet, roundId, eliminated } = req.body;
+  if (!wallet) return res.status(400).json({ error: 'wallet required' });
+  try {
+    const roundKey = roundId || currentRoundId || 'current';
+    const participants = loadParticipants();
+    const list = participants[roundKey] || [];
+
+    // Check if all agents have reported time-up
+    const p = list.find(x => x.wallet === wallet);
+    if (p) { p.timeUp = true; saveParticipants(participants); }
+
+    // Find winner: alive agents sorted by PnL
+    const alive   = list.filter(x => !x.eliminated);
+    const allDone = list.every(x => x.eliminated || x.timeUp);
+
+    if (allDone && list.length > 0) {
+      let winner, reason;
+      if (alive.length > 0) {
+        winner = alive.sort((a,b) => (b.pnl||0) - (a.pnl||0))[0];
+        reason = alive.length === 1 ? 'Last Agent Standing' : 'Highest P&L after 1 hour';
+      } else {
+        winner = list.sort((a,b) => (b.eliminatedAt||0) - (a.eliminatedAt||0))[0];
+        reason = 'Last to be eliminated';
+      }
+
+      // Announce winner publicly
+      if (winner) {
+        // Prize split: 70% winner, 15% burn, 15% LP
+        const prizeAgents = list.length * 1_000_000; // 1M per player
+        const winnerPrize = Math.floor(prizeAgents * 0.70);
+        const burnAmt     = Math.floor(prizeAgents * 0.15);
+        const lpAmt       = Math.floor(prizeAgents * 0.15);
+        await notify(
+          `🏆 *ARENA ROUND OVER!*\n\n` +
+          `🥇 Winner: \`${winner.wallet.slice(0,8)}...${winner.wallet.slice(-6)}\`\n` +
+          `Strategy: ${(winner.strategy||'?').toUpperCase()}\n` +
+          `P&L: ${(winner.pnl||0).toFixed(2)}%\n` +
+          `Reason: ${reason}\n\n` +
+          `💰 Prize: ${winnerPrize.toLocaleString()} $AGENT (70%)\n` +
+          `🔥 Burned: ${burnAmt.toLocaleString()} $AGENT (15%)\n` +
+          `💧 LP Fund: ${lpAmt.toLocaleString()} $AGENT (15%)\n\n` +
+          `Winner: tap 💰 Claim Prize in the bot!\n` +
+          `🏟 suiagent.xyz/#arena`
+        );
+      }
+    }
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════
+// ARENA — notify round started (called when 10 join)
+// ══════════════════════════════════════════
+app.post('/arena/start-notification', async (req, res) => {
+  const { roundId, count } = req.body;
+  try {
+    await notify(
+      `⚔️ *ARENA ROUND STARTED!*\n\n` +
+      `${count || 10} agents have entered the arena!\n` +
+      `1 hour battle begins NOW.\n\n` +
+      `Last Agent Standing wins all!\n` +
+      `Prize: 70% to winner | 15% burn 🔥 | 15% LP\n\n` +
+      `🏟 suiagent.xyz/#arena`
+    );
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══════════════════════════════════════════
 // ARENA — set round (admin)
 // ══════════════════════════════════════════
@@ -738,4 +877,32 @@ app.get('/users/load', (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   res.json({ users: botUsers, count: Object.keys(botUsers).length });
+});
+
+// ══════════════════════════════════════════
+// TEMP — FORCE SET ARENA ROUND FOR WINNER CLAIM
+// Remove this endpoint after winner claims
+// ══════════════════════════════════════════
+app.post('/arena/set-winner-round', (req, res) => {
+  const { wallet, roundId, adminKey } = req.body;
+  if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (!wallet || !roundId) return res.status(400).json({ error: 'wallet and roundId required' });
+  // Find user by wallet address and set their arenaRound
+  let found = false;
+  for (const [id, u] of Object.entries(botUsers)) {
+    if (u.wallet === wallet) {
+      u.arenaRound = roundId;
+      found = true;
+      console.log(`✅ Set arenaRound for ${wallet} to ${roundId}`);
+    }
+  }
+  saveBotUsers();
+  if (found) {
+    res.json({ success: true, message: 'arenaRound set — winner can now claim via bot' });
+  } else {
+    // User not found by wallet — try to find by partial match
+    res.json({ success: false, message: 'Wallet not found in bot users. Winner must /start the bot first.' });
+  }
 });
