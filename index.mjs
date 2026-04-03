@@ -292,7 +292,8 @@ app.get('/arena/participants', async (req, res) => {
   const roundId = req.query.round || currentRoundId || 'current';
   try {
     const participants = loadParticipants();
-    const list = (participants[roundId] || []).map(p => ({
+    const ARENA_PARENT2 = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
+    const list = (participants[roundId] || participants[ARENA_PARENT2] || []).map(p => ({
       wallet: p.wallet, strategy: p.strategy,
       eliminated: p.eliminated, pnl: p.pnl, registeredAt: p.registeredAt,
     }));
@@ -322,7 +323,9 @@ app.get('/arena/winner', async (req, res) => {
     }
 
     const participants = loadParticipants();
-    const list  = participants[roundId] || [];
+    // Check both round ID and arena parent ID (backward compat)
+    const ARENA_PARENT = '0x1cc3b2ead3ead0a8c198be912e5b8926963718ebc9d737f35e928cd4fddefc5d';
+    const list = participants[roundId] || participants[ARENA_PARENT] || [];
     const alive = list.filter(p => !p.eliminated);
 
     let winner, reason;
@@ -879,53 +882,4 @@ app.get('/users/load', (req, res) => {
   res.json({ users: botUsers, count: Object.keys(botUsers).length });
 });
 
-// ══════════════════════════════════════════
-// TEMP — FORCE SET ARENA ROUND FOR WINNER CLAIM
-// Remove this endpoint after winner claims
-// ══════════════════════════════════════════
-app.post('/arena/set-winner-round', (req, res) => {
-  const { wallet, chatId, roundId, adminKey } = req.body;
-  if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  if (!roundId) return res.status(400).json({ error: 'roundId required' });
 
-  let found = false;
-
-  // Set by chatId directly if provided
-  if (chatId && botUsers[chatId]) {
-    botUsers[chatId].arenaRound = roundId;
-    found = true;
-    console.log('Set arenaRound by chatId', chatId);
-  }
-
-  // Also set by wallet match
-  if (wallet) {
-    for (const [id, u] of Object.entries(botUsers)) {
-      if (u.wallet && u.wallet.toLowerCase() === wallet.toLowerCase()) {
-        u.arenaRound = roundId;
-        found = true;
-        console.log('Set arenaRound by wallet match, chatId', id);
-      }
-    }
-  }
-
-  saveBotUsers();
-  res.json({ success: true, found, message: found ? 'arenaRound set — winner can claim now' : 'Not found' });
-});
-
-// TEMP — let winner claim by wallet address directly
-app.post('/arena/force-claim-info', (req, res) => {
-  const { adminKey } = req.body;
-  if (adminKey !== (process.env.ADMIN_API_KEY || 'agent-admin-2026')) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  // Show all bot users with their wallet + arenaRound
-  const info = Object.entries(botUsers).map(([id, u]) => ({
-    chatId: id,
-    wallet: u.wallet,
-    arenaRound: u.arenaRound,
-    step: u.step
-  }));
-  res.json({ users: info, count: info.length });
-});
