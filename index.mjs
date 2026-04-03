@@ -898,7 +898,7 @@ async function arenaManagerTick() {
       try {
         const kp = getAdminKeypair();
         const tx = new Transaction();
-        tx.moveCall({ target: ARENA_PACKAGE + '::arena::create_round', arguments: [tx.object(ARENA_OBJECT), tx.object(ARENA_ADMIN_CAP), tx.object(CLOCK_ID)] });
+        tx.moveCall({ target: ARENA_PACKAGE + '::arena::open_round', arguments: [tx.object(ARENA_ADMIN_CAP), tx.object(ARENA_OBJECT), tx.object(CLOCK_ID)] });
         tx.setGasBudget(15_000_000);
         const r = await client.signAndExecuteTransaction({ signer: kp, transaction: tx, options: { showEffects: true, showObjectChanges: true } });
         if (r.effects?.status?.status === 'success') {
@@ -909,7 +909,7 @@ async function arenaManagerTick() {
             await notify('🏟 *NEW ARENA ROUND OPEN!*\n\nRegister now to compete!\nEntry: 250,000 $AGENT\n\nFirst 10 agents start the battle!\n🤖 @sui_agent_trader_bot | 🌐 suiagent.xyz');
           }
         }
-      } catch(e) { console.error('create_round error:', e.message); }
+      } catch(e) { console.error('open_round error:', e.message); }
     }
   } catch(e) { console.error('Arena manager tick:', e.message); }
 }
