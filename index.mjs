@@ -4,7 +4,6 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Transaction } from '@mysten/sui/transactions';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { startArenaMonitor } from './arena-monitor.mjs';
 import { startCandlePoller, getCandles, setSuiPrice } from './candles.mjs';
 
 const app  = express();
@@ -796,6 +795,126 @@ app.post('/arena/set-round', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// AUTO ECO FEE CLAIMER — runs every 24h
+// ══════════════════════════════════════════
+async function autoClaimFees() {
+  try {
+    if (!LP_POOL_ID || !LP_ADMIN_CAP) return;
+    const obj     = await client.getObject({ id: LP_POOL_ID, options: { showContent: true } });
+    const f       = obj?.data?.content?.fields || {};
+    const pending = parseInt(f.protocol_fees?.fields?.value || f.protocol_fees || 0);
+    if (pending < 10_000_000) {
+      console.log('Auto-claim skipped — ' + (pending/1e9).toFixed(6) + ' SUI pending (too small)');
+      return;
+    }
+    const keypair   = getAdminKeypair();
+    const devWallet = keypair.toSuiAddress();
+    const tx        = new Transaction();
+    const [feeCoin] = tx.moveCall({
+      target: LP_POOL_PACKAGE + '::pool_lp::withdraw_protocol_fees',
+      arguments: [tx.object(LP_POOL_ID), tx.object(LP_ADMIN_CAP)]
+    });
+    tx.transferObjects([feeCoin], devWallet);
+    tx.setGasBudget(10_000_000);
+    const result = await client.signAndExecuteTransaction({ signer: keypair, transaction: tx, options: { showEffects: true } });
+    if (result.effects?.status?.status === 'success') {
+      const amt = (pending/1e9).toFixed(6);
+      console.log('Auto-claimed ' + amt + ' SUI eco fees to ' + devWallet + ' TX: ' + result.digest);
+      if (process.env.TG_BOT_TOKEN && process.env.ADMIN_CHAT_ID) {
+        const msg = '💰 *Eco Fee Auto-Claimed*\n\nAmount: ' + amt + ' SUI\n[TX](https://suiscan.xyz/mainnet/tx/' + result.digest + ')';
+        fetch('https://api.telegram.org/bot' + process.env.TG_BOT_TOKEN + '/sendMessage', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: process.env.ADMIN_CHAT_ID, text: msg, parse_mode: 'Markdown' })
+        }).catch(() => {});
+      }
+    } else { console.error('Auto-claim failed:', result.effects?.status?.error); }
+  } catch(e) { console.error('Auto-claim error:', e.message); }
+}
+
+// ══════════════════════════════════════════
+// ARENA AUTO-MANAGER — no external file needed
+// Polls every 30s — handles full round lifecycle
+// ══════════════════════════════════════════
+async function startArenaAutoManager() {
+  await arenaManagerTick();
+  setInterval(arenaManagerTick, 30_000);
+}
+
+async function arenaManagerTick() {
+  try {
+    if (!currentRoundId) return;
+    const obj   = await client.getObject({ id: currentRoundId, options: { showContent: true } });
+    const f     = obj?.data?.content?.fields || {};
+    const state = parseInt(f.state ?? 0);
+    const endTime = parseInt(f.end_time || 0);
+    const now   = Date.now();
+
+    if (state === 0 && parseInt(f.active_count || 0) >= 10) {
+      // OPEN: 10 agents joined — start the round
+      console.log('Arena: 10 agents — calling start_round...');
+      try {
+        const kp = getAdminKeypair();
+        const tx = new Transaction();
+        tx.moveCall({ target: ARENA_PACKAGE + '::arena::start_round', arguments: [tx.object(ARENA_ADMIN_CAP), tx.object(currentRoundId), tx.object(CLOCK_ID)] });
+        tx.setGasBudget(15_000_000);
+        const r = await client.signAndExecuteTransaction({ signer: kp, transaction: tx, options: { showEffects: true } });
+        if (r.effects?.status?.status === 'success') {
+          console.log('Arena: round started', r.digest);
+          await notify('⚔️ *ARENA BATTLE STARTED!*\n\n10 AI agents now battling for 1 hour!\n\n⚡ 70% to winner | 🔥 15% burned | 💧 15% LP\n🏟 suiagent.xyz');
+        }
+      } catch(e) { console.error('start_round error:', e.message); }
+
+    } else if (state === 1 && endTime > 0 && now >= endTime) {
+      // ACTIVE: time up — determine winner and end round
+      console.log('Arena: time up — calling end_round...');
+      const participants = loadParticipants();
+      const list  = participants[currentRoundId] || participants[ARENA_OBJECT] || [];
+      const alive = list.filter(p => !p.eliminated);
+      const winnerWallet = alive.length > 0
+        ? alive.sort((a,b) => (b.pnl||0)-(a.pnl||0))[0].wallet
+        : list.length > 0
+          ? list.sort((a,b) => (b.eliminatedAt||0)-(a.eliminatedAt||0))[0].wallet
+          : f.winner?.fields?.vec?.[0] || null;
+      if (!winnerWallet) { console.log('Arena: no winner found yet'); return; }
+      try {
+        const kp = getAdminKeypair();
+        const tx = new Transaction();
+        tx.moveCall({ target: ARENA_PACKAGE + '::arena::end_round', arguments: [tx.object(ARENA_ADMIN_CAP), tx.object(currentRoundId), tx.pure.address(winnerWallet), tx.object(CLOCK_ID)] });
+        tx.setGasBudget(15_000_000);
+        const r = await client.signAndExecuteTransaction({ signer: kp, transaction: tx, options: { showEffects: true } });
+        if (r.effects?.status?.status === 'success') {
+          console.log('Arena: round ended. Winner:', winnerWallet);
+          const prizeRaw = parseInt(f.prize_pool?.fields?.value || f.prize_pool || 0);
+          const w = list.find(p => p.wallet === winnerWallet) || { wallet: winnerWallet, strategy: '?' };
+          const prizeAmt = Math.floor(prizeRaw * 0.70 / 1_000_000).toLocaleString();
+          await notify('🏆 *ARENA WINNER!*\n\nWinner: `' + winnerWallet.slice(0,8) + '...' + winnerWallet.slice(-6) + '`\nStrategy: ' + (w.strategy||'?').toUpperCase() + '\n\n💰 Prize: ' + prizeAmt + ' $AGENT (70%)\n🔥 15% burned | 💧 15% LP\n\nTap 💰 Claim Prize in @sui_agent_trader_bot\n🏟 suiagent.xyz');
+          if (w) { w.announcedWinner = true; saveParticipants(participants); }
+        }
+      } catch(e) { console.error('end_round error:', e.message); }
+
+    } else if (state === 2 && f.prize_claimed) {
+      // ENDED: prize claimed — create next round automatically
+      console.log('Arena: prize claimed — creating new round...');
+      try {
+        const kp = getAdminKeypair();
+        const tx = new Transaction();
+        tx.moveCall({ target: ARENA_PACKAGE + '::arena::create_round', arguments: [tx.object(ARENA_OBJECT), tx.object(ARENA_ADMIN_CAP), tx.object(CLOCK_ID)] });
+        tx.setGasBudget(15_000_000);
+        const r = await client.signAndExecuteTransaction({ signer: kp, transaction: tx, options: { showEffects: true, showObjectChanges: true } });
+        if (r.effects?.status?.status === 'success') {
+          const newRound = r.objectChanges?.find(c => c.type === 'created' && c.objectType?.includes('Round'));
+          if (newRound?.objectId) {
+            currentRoundId = newRound.objectId;
+            console.log('Arena: new round created:', currentRoundId);
+            await notify('🏟 *NEW ARENA ROUND OPEN!*\n\nRegister now to compete!\nEntry: 250,000 $AGENT\n\nFirst 10 agents start the battle!\n🤖 @sui_agent_trader_bot | 🌐 suiagent.xyz');
+          }
+        }
+      } catch(e) { console.error('create_round error:', e.message); }
+    }
+  } catch(e) { console.error('Arena manager tick:', e.message); }
+}
+
+// ══════════════════════════════════════════
 // START SERVER
 // ══════════════════════════════════════════
 app.listen(PORT, () => {
@@ -805,13 +924,15 @@ app.listen(PORT, () => {
   console.log(`Arena:     ${ARENA_PACKAGE}`);
   console.log(`Round:     ${currentRoundId}`);
   console.log(`LP Pool:   ${LP_POOL_ID || 'not deployed yet'}`);
-  // Start arena monitor
-  if (currentRoundId) {
-    startArenaMonitor(currentRoundId).catch(e => console.error('Monitor error:', e.message));
-    console.log('🏟 Arena monitor started');
-  }
+  // Start inline arena auto-manager
+  startArenaAutoManager();
+  console.log('🏟 Arena auto-manager started (every 30s)');
   // Start candle aggregator
   startCandlePoller();
+  // Auto-claim eco fees every 24h
+  setTimeout(autoClaimFees, 5000);
+  setInterval(autoClaimFees, 24 * 60 * 60 * 1000);
+  console.log('💰 Auto eco fee claimer started (every 24h)');
 });
 
 // ══════════════════════════════════════════
