@@ -42,7 +42,7 @@ function getAdminKeypair() {
 }
 
 // ─── CURRENT ROUND ───
-let currentRoundId = process.env.CURRENT_ROUND_ID || '0x1e0b8b0fc3b79ec750bb258df0eca82f80a194d79229d2f1ec798ba28c6f6c45';
+let currentRoundId = process.env.CURRENT_ROUND_ID || '0x43e1d41dd58b6b9fd8861bd47c119e19348c9de8184ab32ac6a5a55ddf63f36c';
 
 // ─── PARTICIPANT STORE ───
 const PARTICIPANTS_FILE = './arena-participants.json';
